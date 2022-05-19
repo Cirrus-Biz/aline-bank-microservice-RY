@@ -1,0 +1,36 @@
+pipeline {
+    environment {
+        registry = "541351699142.dkr.ecr.us-east-1.amazonaws.com/cirrus-aline-bank-ry"
+        registryCredential = 'my.aws.credentials'
+        dockerImage = ''
+    }
+    agent any
+    stages {
+        stage('Package') { 
+            steps {
+                sh 'mvn clean package -Dmaven.test.failure.ignore=true' 
+            }
+        }
+        stage('Build') {
+            steps {
+                script {
+                    dockerImage = docker.build registry + ":$BUILD_NUMBER"
+                }
+            }
+        }
+        stage('Deploy Image') {
+            steps {
+                script {
+                    docker.withRegistry("https://" + registry, "ecr:us-east-1:" + registryCredential) {
+                        dockerImage.push()
+                    }
+                }
+            }
+        }
+        stage ('Clean Up') {
+            steps {
+                sh 'docker rmi $registry:$BUILD_NUMBER'
+            }
+        }
+    }
+}
