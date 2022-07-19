@@ -1,43 +1,109 @@
 pipeline {
     environment {
-        registry = "541351699142.dkr.ecr.us-east-1.amazonaws.com/cirrus-aline-bank-ry"
-        registryCredential = 'my.aws.credentials'
+        ecr_url = credentials('ry_ecr_url')
+        registryEndpoint = 'aline-bank-ry'
+        registryCredential = 'ry-aws-credentials'
+        THE_BUTLER_SAYS_SO = credentials('ry-aws-credentials')
         dockerImage = ''
+        dockerImage2 = ''
+        DOCKER_USERNAME = 'AWS'
+        AWS_PROFILE = "ry-ecs"
+        ecs_a_key = credentials('ry_access_key')
+        ecs_s_key = credentials('ry_secret_access_key')
     }
     agent any
     stages {
-        stage('Package') { 
+        stage('Maven Test') {
             steps {
-                sh 'mvn clean package -Dmaven.test.failure.ignore=true' 
+                sh 'mvn test -Dmaven.test.failure.ignore=true'
+            }
+        }
+        stage('Maven Verify') {
+            steps {
+                sh 'mvn verify -Dmaven.test.failure.ignore=true'
             }
         }
         stage('SonarQube analysis') {
             steps {
-                withSonarQubeEnv(installationName: 'sonar') {
-                    sh 'mvn org.sonarsource.scanner.maven:sonar-maven-plugin:3.7.0.1746:sonar'
+                withSonarQubeEnv(installationName: 'sonarqube') {
+                    sh 'mvn sonar:sonar'
                 }
-            }   
+            } 
+        }
+        stage("Quality gate") {
+            steps {
+                waitForQualityGate abortPipeline: true
+            }
+        }
+        stage('Package') { 
+            steps {
+                sh 'mvn -Dmaven.test.failure.ignore=true clean package' 
+            }
         }
         stage('Build') {
             steps {
                 script {
-                    dockerImage = docker.build registry + ":$BUILD_NUMBER"
+                    dockerImage = docker.build "$env.AWS_ECR_REGISTRY" + "/" + registryEndpoint + ":${GIT_COMMIT}"
+                    dockerImage2 = docker.build "$env.AWS_ECR_REGISTRY" + "/" + registryEndpoint + ":latest"
                 }
             }
         }
-        stage('Deploy Image') {
+        stage('Publish Image') {
             steps {
                 script {
-                    docker.withRegistry("https://" + registry, "ecr:us-east-1:" + registryCredential) {
+                    docker.withRegistry("https://$env.AWS_ECR_REGISTRY", "ecr:$env.AWS_REGION:ry-aws-credentials") {
                         dockerImage.push()
+                    }
+                    docker.withRegistry("https://$env.AWS_ECR_REGISTRY", "ecr:$env.AWS_REGION:ry-aws-credentials") {
+                        dockerImage2.push()
                     }
                 }
             }
         }
-        stage ('Clean Up') {
+        stage('Wget Docker Compose'){
             steps {
-                sh 'docker rmi $registry:$BUILD_NUMBER'
+                sh 'wget https://raw.githubusercontent.com/Cirrus-Biz/docker-ry/Feature-CB-88-Docker-Compose-Via-Jenkins/docker-compose.yml'
+                sh 'rm docker-compose.yml'
+                sh 'curl https://raw.githubusercontent.com/Cirrus-Biz/docker-ry/Feature-CB-88-Docker-Compose-Via-Jenkins/docker-compose.yml'
+                sh 'wget https://raw.githubusercontent.com/Cirrus-Biz/docker-ry/Feature-CB-88-Docker-Compose-Via-Jenkins/docker-compose.yml'
             }
+        }
+        stage('Docker Hard Clean') {
+            steps {
+                sh 'docker context use default'
+                sh 'sudo docker system prune -a --volumes -f'
+            }
+        }
+        stage('ECS Context Creation') {
+            steps {
+                sh 'aws configure set aws_access_key_id ${ecs_a_key} --profile ${AWS_PROFILE}'
+                sh 'aws configure set aws_secret_access_key_id ${ecs_s_key} --profile ${AWS_PROFILE}'
+                sh 'aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${ecr_url}${registryEndpoint}'
+                sh 'docker context create ecs ${AWS_PROFILE} --profile ${AWS_PROFILE}'
+                sh 'docker context use ${AWS_PROFILE}'
+            }
+        }
+        stage('Docker Compose Up') {
+            steps {
+                sh '''aws secretsmanager get-secret-value --secret-id RY-aline-environment-variables | jq -r '.["SecretString"]' | jq '.' | jq -r 'keys[] as \$k | "export \\(\$k)=\\(.[\$k])"' > .env'''
+                sh '. ./.env'
+                sh 'docker compose -p "RY-aline-finacial" up -d'
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker context use default'
+            sh 'docker context rm ${AWS_PROFILE}'
+            sh "docker rmi $env.AWS_ECR_REGISTRY/$registryEndpoint:${GIT_COMMIT}"
+            sh "docker rmi $env.AWS_ECR_REGISTRY/$registryEndpoint:latest"
+            sh 'sudo docker system prune --all -f'
+            sh 'sudo docker logout'
+            sh 'sudo rm ./.env'
+            sh 'sudo rm -rf ~/.aws/'
+            sh 'sudo rm -rf ~/jenkins/workspace/${JOB_NAME}/*'
+            sh 'sudo rm -rf ~/jenkins/workspace/${JOB_NAME}/.git'
         }
     }
 }
